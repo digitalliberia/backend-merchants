@@ -14,15 +14,25 @@ const PORT = process.env.MERCHANT_PORT || 3000;
 app.use(helmet());
 app.use(express.json());
 
-// ============ RATE LIMITING (without trust proxy issues) ============
-const merchantLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 100,
-  message: { error: 'Too many requests. Please wait a moment.' },
-  // Disable trust proxy validation to avoid the warning
-  validate: { trustProxy: false }
-});
-app.use('/merchants', merchantLimiter);
+// ============ RATE LIMITING - DISABLED to avoid proxy warnings ============
+// Simple manual rate limiting instead of express-rate-limit to avoid warnings
+const requestCounts = new Map();
+setInterval(() => requestCounts.clear(), 60000); // Clear every minute
+
+function simpleRateLimit(req, res, next) {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+  const count = requestCounts.get(ip) || 0;
+  
+  if (count > 100) {
+    return res.status(429).json({ error: 'Too many requests. Please wait a moment.' });
+  }
+  
+  requestCounts.set(ip, count + 1);
+  next();
+}
+
+// Apply rate limiting to all merchant endpoints
+app.use('/merchants', simpleRateLimit);
 
 // ============ DATABASE CONNECTION ============
 let pool;
@@ -245,7 +255,7 @@ app.get('/merchants/profile', requireMerchantAuth, async (req, res) => {
   }
 });
 
-// ============ WALLET BALANCE (Using wallets table) ============
+// ============ WALLET BALANCE ============
 
 app.get('/merchants/wallet', requireMerchantAuth, async (req, res) => {
   try {
@@ -319,7 +329,6 @@ app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
   const limitNum = parseInt(limit) || 50;
   
   try {
-    // Use query() instead of execute() to avoid parameter binding issues with LIMIT
     const [transactions] = await pool.query(
       `SELECT 
         transactionId as id,
