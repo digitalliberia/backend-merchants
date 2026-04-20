@@ -10,8 +10,8 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.MERCHANT_PORT || 3000;
 
-// ============ TRUST PROXY (for Nginx reverse proxy) ============
-app.set('trust proxy', 1);
+// ============ TRUST PROXY (for Nginx reverse proxy) - MUST BE FIRST ============
+app.set('trust proxy', true);
 
 // ============ SECURITY MIDDLEWARE ============
 app.use(helmet());
@@ -22,7 +22,8 @@ const merchantLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
   message: { error: 'Too many requests. Please wait a moment.' },
-  trustProxy: true
+  trustProxy: true,
+  validate: { trustProxy: false }
 });
 app.use('/merchants', merchantLimiter);
 
@@ -55,7 +56,7 @@ async function initDatabase() {
       password_hash VARCHAR(255) NULL,
       reset_token VARCHAR(255) NULL,
       reset_token_expires DATETIME NULL,
-      status ENUM('active', 'suspended', 'pending') DEFAULT 'pending',
+      status ENUM('active', 'suspended', 'pending') DEFAULT 'active',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_email (email),
@@ -125,24 +126,15 @@ async function initDatabase() {
     console.log('⚠️ merchant_transactions table error:', err.message);
   }
 
-  // Create trigger to automatically create wallet for new merchants
-  const createWalletTriggerSQL = `
-    DROP TRIGGER IF EXISTS create_merchant_wallet;
-    CREATE TRIGGER create_merchant_wallet
-    AFTER INSERT ON merchants
-    FOR EACH ROW
-    BEGIN
-      INSERT INTO merchant_wallets (merchant_dssn, usd_balance, lrd_balance)
-      VALUES (NEW.DSSN, 0.00, 0.00)
-      ON DUPLICATE KEY UPDATE updated_at = NOW();
-    END;
-  `;
-
+  // Initialize wallet for existing merchants
   try {
-    await pool.execute(createWalletTriggerSQL);
-    console.log('✅ merchant wallet trigger ready');
+    await pool.execute(`
+      INSERT IGNORE INTO merchant_wallets (merchant_dssn, usd_balance, lrd_balance)
+      SELECT DSSN, 0.00, 0.00 FROM merchants
+    `);
+    console.log('✅ Initialized wallets for existing merchants');
   } catch (err) {
-    console.log('⚠️ Trigger may already exist:', err.message);
+    console.log('⚠️ Wallet initialization error:', err.message);
   }
 }
 
@@ -676,14 +668,20 @@ app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
 
 // ============ TRANSACTION ENDPOINTS (FIXED) ============
 
-// Get merchant transactions - FIXED VERSION
+// Get merchant transactions - FIXED VERSION with proper number conversion
 app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
+  // Parse and validate limit and offset as numbers
   const limit = parseInt(req.query.limit) || 50;
   const offset = parseInt(req.query.offset) || 0;
   
+  // Ensure they are valid numbers
+  const safeLimit = isNaN(limit) ? 50 : Math.min(limit, 1000);
+  const safeOffset = isNaN(offset) ? 0 : offset;
+  
   try {
-    console.log(`Fetching transactions for merchant: ${req.merchant.dssn}, limit: ${limit}, offset: ${offset}`);
+    console.log(`Fetching transactions for merchant: ${req.merchant.dssn}, limit: ${safeLimit}, offset: ${safeOffset}`);
     
+    // Use template literals for numbers to ensure proper type
     const [transactions] = await pool.execute(
       `SELECT id, reference, amount, currency, type, status, recipient_email, sender_email, description, created_at
        FROM merchant_transactions
@@ -691,7 +689,7 @@ app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
        ORDER BY created_at DESC
        LIMIT ?
        OFFSET ?`,
-      [req.merchant.dssn, limit, offset]
+      [req.merchant.dssn, safeLimit, safeOffset]
     );
     
     console.log(`Found ${transactions.length} transactions`);
@@ -735,7 +733,12 @@ app.get('/merchants/transactions/:reference', requireMerchantAuth, async (req, r
 
 // Get all products
 app.get('/merchants/products', requireMerchantAuth, async (req, res) => {
-  const { limit = 100, offset = 0, category, status } = req.query;
+  const limit = parseInt(req.query.limit) || 100;
+  const offset = parseInt(req.query.offset) || 0;
+  const { category, status } = req.query;
+  
+  const safeLimit = isNaN(limit) ? 100 : Math.min(limit, 1000);
+  const safeOffset = isNaN(offset) ? 0 : offset;
   
   try {
     let query = `
@@ -756,7 +759,7 @@ app.get('/merchants/products', requireMerchantAuth, async (req, res) => {
     }
     
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(safeLimit, safeOffset);
     
     const [products] = await pool.execute(query, params);
     
@@ -878,7 +881,12 @@ app.delete('/merchants/products/:productId', requireMerchantAuth, async (req, re
 
 // Get all orders
 app.get('/merchants/orders', requireMerchantAuth, async (req, res) => {
-  const { limit = 50, offset = 0, status } = req.query;
+  const limit = parseInt(req.query.limit) || 50;
+  const offset = parseInt(req.query.offset) || 0;
+  const { status } = req.query;
+  
+  const safeLimit = isNaN(limit) ? 50 : Math.min(limit, 1000);
+  const safeOffset = isNaN(offset) ? 0 : offset;
   
   try {
     let query = `
@@ -894,7 +902,7 @@ app.get('/merchants/orders', requireMerchantAuth, async (req, res) => {
     }
     
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(safeLimit, safeOffset);
     
     const [orders] = await pool.execute(query, params);
     
