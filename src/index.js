@@ -10,6 +10,9 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.MERCHANT_PORT || 3000;
 
+// ============ TRUST PROXY (for Nginx reverse proxy) ============
+app.set('trust proxy', 1);
+
 // ============ SECURITY MIDDLEWARE ============
 app.use(helmet());
 app.use(express.json());
@@ -18,7 +21,8 @@ app.use(express.json());
 const merchantLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
-  message: { error: 'Too many requests. Please wait a moment.' }
+  message: { error: 'Too many requests. Please wait a moment.' },
+  trustProxy: true
 });
 app.use('/merchants', merchantLimiter);
 
@@ -515,8 +519,7 @@ app.get('/merchants/wallet', requireMerchantAuth, async (req, res) => {
       success: true,
       data: {
         usd_balance: wallet.usd_balance,
-        lrd_balance: wallet.lrd_balance,
-        currency: 'USD'
+        lrd_balance: wallet.lrd_balance
       }
     });
   } catch (error) {
@@ -671,21 +674,27 @@ app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
   }
 });
 
-// ============ TRANSACTION ENDPOINTS ============
+// ============ TRANSACTION ENDPOINTS (FIXED) ============
 
-// Get merchant transactions
+// Get merchant transactions - FIXED VERSION
 app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
-  const { limit = 50, offset = 0 } = req.query;
+  const limit = parseInt(req.query.limit) || 50;
+  const offset = parseInt(req.query.offset) || 0;
   
   try {
+    console.log(`Fetching transactions for merchant: ${req.merchant.dssn}, limit: ${limit}, offset: ${offset}`);
+    
     const [transactions] = await pool.execute(
       `SELECT id, reference, amount, currency, type, status, recipient_email, sender_email, description, created_at
        FROM merchant_transactions
        WHERE merchant_dssn = ?
        ORDER BY created_at DESC
-       LIMIT ? OFFSET ?`,
-      [req.merchant.dssn, parseInt(limit), parseInt(offset)]
+       LIMIT ?
+       OFFSET ?`,
+      [req.merchant.dssn, limit, offset]
     );
+    
+    console.log(`Found ${transactions.length} transactions`);
     
     res.json({
       success: true,
@@ -693,7 +702,7 @@ app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
     });
   } catch (error) {
     console.error('Get transactions error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
 
