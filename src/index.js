@@ -250,7 +250,6 @@ app.get('/merchants/profile', requireMerchantAuth, async (req, res) => {
 
 app.get('/merchants/wallet', requireMerchantAuth, async (req, res) => {
   try {
-    // Get wallet from the wallets table using email
     const [wallets] = await pool.execute(
       'SELECT balance as usd_balance, lrd_balance FROM wallets WHERE email = ?',
       [req.merchant.email]
@@ -283,7 +282,6 @@ app.get('/merchants/wallet', requireMerchantAuth, async (req, res) => {
 
 app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
   try {
-    // Get total sales where merchant received payments
     const [salesStats] = await pool.execute(
       `SELECT 
         COALESCE(SUM(CASE WHEN currency = 'USD' THEN amount ELSE 0 END), 0) as total_sales_usd,
@@ -300,7 +298,9 @@ app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
         total_sales: parseFloat(salesStats[0]?.total_sales_usd || 0),
         total_sales_lrd: parseFloat(salesStats[0]?.total_sales_lrd || 0),
         total_transactions: parseInt(salesStats[0]?.total_transactions || 0),
-        average_order_value: parseFloat(salesStats[0]?.total_sales_usd / (salesStats[0]?.total_transactions || 1) || 0),
+        average_order_value: salesStats[0]?.total_transactions > 0 
+          ? parseFloat(salesStats[0]?.total_sales_usd / salesStats[0]?.total_transactions) 
+          : 0,
         monthly_growth: 0,
         pending_orders: 0,
         completed_orders: parseInt(salesStats[0]?.total_transactions || 0),
@@ -313,14 +313,15 @@ app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
   }
 });
 
-// ============ TRANSACTIONS (Using transactions table) ============
+// ============ TRANSACTIONS (FIXED - Using query instead of execute for LIMIT) ============
 
 app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
   const { limit = 50 } = req.query;
   const limitNum = parseInt(limit) || 50;
   
   try {
-    const [transactions] = await pool.execute(
+    // Use query() instead of execute() to avoid parameter binding issues with LIMIT
+    const [transactions] = await pool.query(
       `SELECT 
         transactionId as id,
         reference,
@@ -336,11 +337,10 @@ app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
       FROM transactions
       WHERE sender_email = ? OR recipient_email = ?
       ORDER BY created_at DESC
-      LIMIT ?`,
-      [req.merchant.email, req.merchant.email, limitNum]
+      LIMIT ${limitNum}`,
+      [req.merchant.email, req.merchant.email]
     );
     
-    // Format transactions
     const formattedTransactions = transactions.map(t => {
       const isSender = t.sender_email === req.merchant.email;
       return {
@@ -375,14 +375,12 @@ app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
 
 app.get('/merchants/dashboard/overview', requireMerchantAuth, async (req, res) => {
   try {
-    // Get wallet balance
     const [wallets] = await pool.execute(
       'SELECT balance as usd_balance, lrd_balance FROM wallets WHERE email = ?',
       [req.merchant.email]
     );
     
-    // Get recent transactions
-    const [recentTransactions] = await pool.execute(
+    const [recentTransactions] = await pool.query(
       `SELECT 
         transactionId as id,
         reference,
