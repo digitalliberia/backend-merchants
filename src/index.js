@@ -14,10 +14,25 @@ const PORT = process.env.MERCHANT_PORT || 3000;
 app.use(helmet());
 app.use(express.json());
 
-// ============ RATE LIMITING - DISABLED to avoid proxy warnings ============
-// Simple manual rate limiting instead of express-rate-limit to avoid warnings
+// ============ RATE LIMITING ============
+const sendMoneyLimiter = rateLimit({ 
+  windowMs: 60 * 1000, 
+  max: 10, 
+  message: { error: 'Too many transactions. Please wait a moment.' } 
+});
+const lookupLimiter = rateLimit({ 
+  windowMs: 60 * 1000, 
+  max: 30, 
+  message: { error: 'Too many lookup requests. Please slow down.' } 
+});
+
+// Apply specific rate limits to wallet endpoints
+app.use('/merchants/wallet/send', sendMoneyLimiter);
+app.use('/merchants/wallet/lookup', lookupLimiter);
+
+// Simple rate limiting for other endpoints
 const requestCounts = new Map();
-setInterval(() => requestCounts.clear(), 60000); // Clear every minute
+setInterval(() => requestCounts.clear(), 60000);
 
 function simpleRateLimit(req, res, next) {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
@@ -31,7 +46,6 @@ function simpleRateLimit(req, res, next) {
   next();
 }
 
-// Apply rate limiting to all merchant endpoints
 app.use('/merchants', simpleRateLimit);
 
 // ============ DATABASE CONNECTION ============
@@ -54,6 +68,10 @@ async function initDatabase() {
 // ============ HELPER FUNCTIONS ============
 
 function generateReference() {
+  return `TXN-${Date.now()}-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+}
+
+function generateMerchantReference() {
   return `MRCH-${Date.now()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 }
 
@@ -287,6 +305,252 @@ app.get('/merchants/wallet', requireMerchantAuth, async (req, res) => {
   }
 });
 
+// ============ LOOKUP USER (for sending money) ============
+
+app.post('/merchants/wallet/lookup', requireMerchantAuth, async (req, res) => {
+  const { contact } = req.body;
+  
+  if (!contact) {
+    return res.status(400).json({ error: 'Contact is required' });
+  }
+  
+  try {
+    const isEmail = contact.includes('@');
+    const query = isEmail 
+      ? 'SELECT email, first_name, last_name, phone, is_active FROM users WHERE email = ?'
+      : 'SELECT email, first_name, last_name, phone, is_active FROM users WHERE phone = ?';
+    
+    const [users] = await pool.execute(query, [contact]);
+    
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = users[0];
+    
+    if (user.is_active === 0) {
+      return res.status(403).json({ error: 'User account is frozen. Cannot send money.' });
+    }
+    
+    res.json({ 
+      success: true, 
+      data: { 
+        email: user.email, 
+        first_name: user.first_name, 
+        last_name: user.last_name, 
+        phone: user.phone, 
+        is_active: user.is_active === 1 
+      } 
+    });
+  } catch (error) {
+    console.error('Lookup error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ SEND MONEY ============
+
+app.post('/merchants/wallet/send', requireMerchantAuth, async (req, res) => {
+  const { recipient_contact, amount, currency, description, purpose } = req.body;
+  
+  if (!recipient_contact) {
+    return res.status(400).json({ error: 'Recipient contact is required' });
+  }
+  
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ error: 'Valid amount is required' });
+  }
+  
+  if (!['USD', 'LRD'].includes(currency)) {
+    return res.status(400).json({ error: 'Invalid currency' });
+  }
+  
+  let connection;
+  
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    // Find recipient
+    const isEmail = recipient_contact.includes('@');
+    const recipientQuery = isEmail 
+      ? 'SELECT email, first_name, last_name, is_active FROM users WHERE email = ?'
+      : 'SELECT email, first_name, last_name, is_active FROM users WHERE phone = ?';
+    
+    const [recipients] = await connection.execute(recipientQuery, [recipient_contact]);
+    
+    if (recipients.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Recipient not found' });
+    }
+    
+    const recipient = recipients[0];
+    
+    // Check if sending to self
+    if (recipient.email === req.merchant.email) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Cannot send money to yourself' });
+    }
+    
+    // Check if recipient account is active
+    if (recipient.is_active === 0) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Recipient account is frozen. Cannot send money.' });
+    }
+    
+    // Get sender's wallet balance
+    const [senderWallets] = await connection.execute(
+      'SELECT balance, lrd_balance FROM wallets WHERE email = ?',
+      [req.merchant.email]
+    );
+    
+    if (senderWallets.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Sender wallet not found' });
+    }
+    
+    const balanceField = currency === 'USD' ? 'balance' : 'lrd_balance';
+    const currentBalance = parseFloat(senderWallets[0][balanceField]);
+    
+    if (currentBalance < amount) {
+      await connection.rollback();
+      return res.status(400).json({ error: `Insufficient ${currency} balance` });
+    }
+    
+    // Update sender's wallet (subtract)
+    await connection.execute(
+      `UPDATE wallets SET ${balanceField} = ${balanceField} - ? WHERE email = ?`,
+      [amount, req.merchant.email]
+    );
+    
+    // Update recipient's wallet (add)
+    await connection.execute(
+      `UPDATE wallets SET ${balanceField} = ${balanceField} + ? WHERE email = ?`,
+      [amount, recipient.email]
+    );
+    
+    // Create transaction record
+    const reference = generateReference();
+    const transactionPurpose = purpose || description || 'Money transfer';
+    
+    await connection.execute(
+      `INSERT INTO transactions (reference, sender_email, recipient_email, amount, currency, original_amount, status, transaction_type, notes, purpose, created_at) 
+       VALUES (?, ?, ?, ?, ?, ?, 'completed', 'transfer', ?, ?, NOW())`,
+      [reference, req.merchant.email, recipient.email, amount, currency, amount, transactionPurpose, transactionPurpose]
+    );
+    
+    await connection.commit();
+    
+    // Get updated wallet balance
+    const [updatedWallet] = await pool.execute(
+      'SELECT balance, lrd_balance FROM wallets WHERE email = ?',
+      [req.merchant.email]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: `${currency} ${amount.toLocaleString()} sent successfully`, 
+      data: { 
+        transaction_reference: reference, 
+        amount, 
+        currency, 
+        purpose: transactionPurpose, 
+        recipient: { 
+          name: `${recipient.first_name} ${recipient.last_name}`, 
+          email: recipient.email 
+        }, 
+        new_balance_usd: parseFloat(updatedWallet[0].balance), 
+        new_balance_lrd: parseFloat(updatedWallet[0].lrd_balance) 
+      } 
+    });
+    
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Send money error:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// ============ GET TRANSACTIONS (for wallet) ============
+
+app.get('/merchants/wallet/transactions', requireMerchantAuth, async (req, res) => {
+  const { limit = 50 } = req.query;
+  const limitNum = parseInt(limit) || 50;
+  
+  try {
+    const [transactions] = await pool.query(
+      `SELECT 
+        transactionId as id,
+        reference,
+        amount,
+        currency,
+        status,
+        notes as description,
+        purpose,
+        created_at,
+        sender_email,
+        recipient_email,
+        transaction_type as type
+      FROM transactions
+      WHERE sender_email = ? OR recipient_email = ?
+      ORDER BY created_at DESC
+      LIMIT ${limitNum}`,
+      [req.merchant.email, req.merchant.email]
+    );
+    
+    // Format transactions with counterparty names
+    const formattedTransactions = [];
+    
+    for (const t of transactions) {
+      const isSender = t.sender_email === req.merchant.email;
+      let counterpartyName = isSender ? t.recipient_email : t.sender_email;
+      let counterpartyEmail = isSender ? t.recipient_email : t.sender_email;
+      
+      // Try to get real name from users table
+      try {
+        const otherEmail = isSender ? t.recipient_email : t.sender_email;
+        const [users] = await pool.query(
+          'SELECT first_name, last_name FROM users WHERE email = ?',
+          [otherEmail]
+        );
+        if (users.length > 0) {
+          counterpartyName = `${users[0].first_name} ${users[0].last_name}`;
+        }
+      } catch (err) {
+        // Use email as fallback
+      }
+      
+      formattedTransactions.push({
+        id: t.id,
+        reference: t.reference,
+        amount: parseFloat(t.amount),
+        currency: t.currency,
+        status: t.status,
+        description: t.description || '',
+        purpose: t.purpose || '',
+        created_at: t.created_at,
+        type: isSender ? 'debit' : 'credit',
+        counterparty_name: counterpartyName,
+        counterparty_email: counterpartyEmail,
+        is_sender: isSender
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: formattedTransactions
+    });
+  } catch (error) {
+    console.error('Get transactions error:', error);
+    res.json({
+      success: true,
+      data: []
+    });
+  }
+});
+
 // ============ BUSINESS STATISTICS ============
 
 app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
@@ -322,7 +586,7 @@ app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
   }
 });
 
-// ============ TRANSACTIONS ============
+// ============ TRANSACTIONS (legacy) ============
 
 app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
   const { limit = 50 } = req.query;
@@ -445,6 +709,9 @@ async function start() {
     console.log(`   - POST /merchants/login`);
     console.log(`   - GET  /merchants/profile`);
     console.log(`   - GET  /merchants/wallet`);
+    console.log(`   - POST /merchants/wallet/lookup`);
+    console.log(`   - POST /merchants/wallet/send`);
+    console.log(`   - GET  /merchants/wallet/transactions`);
     console.log(`   - GET  /merchants/stats`);
     console.log(`   - GET  /merchants/transactions`);
     console.log(`   - GET  /merchants/dashboard/overview`);
