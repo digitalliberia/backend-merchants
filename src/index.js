@@ -10,18 +10,17 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.MERCHANT_PORT || 3000;
 
-// ============ TRUST PROXY (for Nginx reverse proxy) ============
-app.set('trust proxy', true);
-
 // ============ SECURITY MIDDLEWARE ============
 app.use(helmet());
 app.use(express.json());
 
-// ============ RATE LIMITING ============
+// ============ RATE LIMITING (without trust proxy issues) ============
 const merchantLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
-  message: { error: 'Too many requests. Please wait a moment.' }
+  message: { error: 'Too many requests. Please wait a moment.' },
+  // Disable trust proxy validation to avoid the warning
+  validate: { trustProxy: false }
 });
 app.use('/merchants', merchantLimiter);
 
@@ -313,7 +312,7 @@ app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
   }
 });
 
-// ============ TRANSACTIONS (FIXED - Using query instead of execute for LIMIT) ============
+// ============ TRANSACTIONS ============
 
 app.get('/merchants/transactions', requireMerchantAuth, async (req, res) => {
   const { limit = 50 } = req.query;
