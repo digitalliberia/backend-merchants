@@ -2149,6 +2149,224 @@ app.get('/merchants/store/stats', requireMerchantAuth, async (req, res) => {
   }
 });
 
+// ============ PUBLIC PRODUCT ENDPOINTS WITH STORE INFO (FOR CUSTOMERS) ============
+
+// Get all products with store/seller information
+app.get('/public/products', async (req, res) => {
+  const { limit = 100, offset = 0, category, type, search } = req.query;
+  const limitNum = parseInt(limit) || 100;
+  const offsetNum = parseInt(offset) || 0;
+  
+  try {
+    let query = `
+      SELECT 
+        p.id, p.name, p.description, p.price_usd, p.price_lrd, p.stock, p.category, 
+        p.product_type, p.image_url, p.status, p.featured, p.sales_count, p.rating, 
+        p.created_at,
+        m.DSSN as merchant_dssn,
+        m.business_name as store_name,
+        m.business_registration_number,
+        m.tax_identification_number,
+        m.email as store_email,
+        m.phone_number as store_phone,
+        m.status as store_status
+      FROM merchant_products p
+      INNER JOIN merchants m ON p.merchant_dssn = m.DSSN
+      WHERE p.status = 'active' AND m.status = 'active'
+    `;
+    const params = [];
+    
+    if (category && category !== 'all') {
+      query += ' AND p.category = ?';
+      params.push(category);
+    }
+    
+    if (type && type !== 'all') {
+      query += ' AND p.product_type = ?';
+      params.push(type);
+    }
+    
+    if (search) {
+      query += ' AND (p.name LIKE ? OR p.description LIKE ?)';
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    
+    query += ' ORDER BY p.featured DESC, p.sales_count DESC, p.created_at DESC LIMIT ? OFFSET ?';
+    params.push(limitNum, offsetNum);
+    
+    const [products] = await pool.query(query, params);
+    
+    res.json({
+      success: true,
+      data: products.map(p => ({
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        price_usd: parseFloat(p.price_usd),
+        price_lrd: parseFloat(p.price_lrd),
+        stock: p.stock,
+        category: p.category,
+        product_type: p.product_type,
+        image_url: p.image_url,
+        featured: p.featured === 1,
+        sales_count: p.sales_count,
+        rating: parseFloat(p.rating) || 0,
+        store: {
+          dssn: p.merchant_dssn,
+          name: p.store_name,
+          registration_number: p.business_registration_number,
+          tax_id: p.tax_identification_number,
+          email: p.store_email,
+          phone: p.store_phone,
+        }
+      }))
+    });
+  } catch (error) {
+    console.error('Get public products error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single product with store information
+app.get('/public/products/:productId', async (req, res) => {
+  const { productId } = req.params;
+  
+  try {
+    const [products] = await pool.query(`
+      SELECT 
+        p.id, p.name, p.description, p.price_usd, p.price_lrd, p.stock, p.category, 
+        p.product_type, p.image_url, p.status, p.featured, p.sales_count, p.rating, 
+        p.created_at,
+        m.DSSN as merchant_dssn,
+        m.business_name as store_name,
+        m.business_registration_number,
+        m.tax_identification_number,
+        m.email as store_email,
+        m.phone_number as store_phone,
+        m.status as store_status
+      FROM merchant_products p
+      INNER JOIN merchants m ON p.merchant_dssn = m.DSSN
+      WHERE p.id = ? AND p.status = 'active' AND m.status = 'active'
+    `, [productId]);
+    
+    if (products.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    const p = products[0];
+    res.json({
+      success: true,
+      data: {
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        price_usd: parseFloat(p.price_usd),
+        price_lrd: parseFloat(p.price_lrd),
+        stock: p.stock,
+        category: p.category,
+        product_type: p.product_type,
+        image_url: p.image_url,
+        featured: p.featured === 1,
+        sales_count: p.sales_count,
+        rating: parseFloat(p.rating) || 0,
+        created_at: p.created_at,
+        store: {
+          dssn: p.merchant_dssn,
+          name: p.store_name,
+          registration_number: p.business_registration_number,
+          tax_id: p.tax_identification_number,
+          email: p.store_email,
+          phone: p.store_phone,
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get public product error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get store/products by merchant DSSN
+app.get('/public/store/:merchantDssn/products', async (req, res) => {
+  const { merchantDssn } = req.params;
+  const { limit = 100, offset = 0 } = req.query;
+  const limitNum = parseInt(limit) || 100;
+  const offsetNum = parseInt(offset) || 0;
+  
+  try {
+    // First get store info
+    const [stores] = await pool.execute(`
+      SELECT DSSN, business_name, business_registration_number, 
+             tax_identification_number, email, phone_number, status
+      FROM merchants WHERE DSSN = ? AND status = 'active'
+    `, [merchantDssn]);
+    
+    if (stores.length === 0) {
+      return res.status(404).json({ error: 'Store not found' });
+    }
+    
+    const store = stores[0];
+    
+    // Then get store products
+    const [products] = await pool.execute(`
+      SELECT id, name, description, price_usd, price_lrd, stock, category, 
+             product_type, image_url, featured, sales_count, rating
+      FROM merchant_products
+      WHERE merchant_dssn = ? AND status = 'active'
+      ORDER BY featured DESC, created_at DESC
+      LIMIT ? OFFSET ?
+    `, [merchantDssn, limitNum, offsetNum]);
+    
+    res.json({
+      success: true,
+      data: {
+        store: {
+          dssn: store.DSSN,
+          name: store.business_name,
+          registration_number: store.business_registration_number,
+          tax_id: store.tax_identification_number,
+          email: store.email,
+          phone: store.phone_number,
+        },
+        products: products.map(p => ({
+          id: p.id,
+          name: p.name,
+          description: p.description,
+          price_usd: parseFloat(p.price_usd),
+          price_lrd: parseFloat(p.price_lrd),
+          stock: p.stock,
+          category: p.category,
+          product_type: p.product_type,
+          image_url: p.image_url,
+          featured: p.featured === 1,
+          sales_count: p.sales_count,
+          rating: parseFloat(p.rating) || 0,
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Get store products error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get categories (public)
+app.get('/public/categories', async (req, res) => {
+  try {
+    const [categories] = await pool.execute(
+      `SELECT DISTINCT category FROM merchant_products WHERE status = 'active' AND category IS NOT NULL`
+    );
+    
+    res.json({
+      success: true,
+      data: categories.map(c => c.category)
+    });
+  } catch (error) {
+    console.error('Get categories error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============ HEALTH CHECK ============
 
 app.get('/health', (req, res) => {
