@@ -690,6 +690,208 @@ app.get('/merchants/dashboard/overview', requireMerchantAuth, async (req, res) =
   }
 });
 
+// ============ BULK PAYOUT / SALARY PAYMENT ============
+
+const bulkPayoutLimiter = rateLimit({ 
+  windowMs: 60 * 1000, 
+  max: 5, 
+  message: { error: 'Too many bulk payout requests. Please wait a moment.' } 
+});
+app.use('/merchants/wallet/bulk-payout', bulkPayoutLimiter);
+
+app.post('/merchants/wallet/bulk-payout', requireMerchantAuth, async (req, res) => {
+  const { payments, currency, description, purpose } = req.body;
+  
+  // payments should be an array of { recipient_contact, amount, note? }
+  if (!payments || !Array.isArray(payments) || payments.length === 0) {
+    return res.status(400).json({ error: 'Payments array is required' });
+  }
+  
+  if (!['USD', 'LRD'].includes(currency)) {
+    return res.status(400).json({ error: 'Invalid currency' });
+  }
+  
+  if (payments.length > 500) {
+    return res.status(400).json({ error: 'Maximum 500 payments per batch' });
+  }
+  
+  let connection;
+  const results = {
+    successful: [],
+    failed: [],
+    total_amount: 0,
+    total_successful: 0,
+    total_failed: 0
+  };
+  
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    // Calculate total amount and validate recipients
+    const validatedPayments = [];
+    
+    for (const payment of payments) {
+      const { recipient_contact, amount, note } = payment;
+      
+      if (!recipient_contact || !amount || amount <= 0) {
+        results.failed.push({ 
+          recipient_contact, 
+          amount, 
+          error: 'Invalid recipient or amount',
+          note 
+        });
+        results.total_failed++;
+        continue;
+      }
+      
+      // Find recipient
+      const isEmail = recipient_contact.includes('@');
+      const recipientQuery = isEmail 
+        ? 'SELECT email, first_name, last_name, is_active FROM users WHERE email = ?'
+        : 'SELECT email, first_name, last_name, is_active FROM users WHERE phone = ?';
+      
+      const [recipients] = await connection.execute(recipientQuery, [recipient_contact]);
+      
+      if (recipients.length === 0) {
+        results.failed.push({ 
+          recipient_contact, 
+          amount, 
+          error: 'Recipient not found',
+          note 
+        });
+        results.total_failed++;
+        continue;
+      }
+      
+      const recipient = recipients[0];
+      
+      if (recipient.email === req.merchant.email) {
+        results.failed.push({ 
+          recipient_contact, 
+          amount, 
+          error: 'Cannot pay yourself',
+          note 
+        });
+        results.total_failed++;
+        continue;
+      }
+      
+      if (recipient.is_active === 0) {
+        results.failed.push({ 
+          recipient_contact, 
+          amount, 
+          error: 'Recipient account is frozen',
+          note 
+        });
+        results.total_failed++;
+        continue;
+      }
+      
+      validatedPayments.push({
+        recipient,
+        amount,
+        note: note || description || 'Salary payment'
+      });
+      
+      results.total_amount += amount;
+    }
+    
+    // Check if merchant has sufficient balance
+    const [senderWallets] = await connection.execute(
+      'SELECT balance, lrd_balance FROM wallets WHERE email = ?',
+      [req.merchant.email]
+    );
+    
+    const balanceField = currency === 'USD' ? 'balance' : 'lrd_balance';
+    const currentBalance = parseFloat(senderWallets[0][balanceField]);
+    
+    if (currentBalance < results.total_amount) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: `Insufficient ${currency} balance. Need ${results.total_amount}, have ${currentBalance}` 
+      });
+    }
+    
+    // Process each payment
+    for (const payment of validatedPayments) {
+      try {
+        // Update sender's wallet (subtract)
+        await connection.execute(
+          `UPDATE wallets SET ${balanceField} = ${balanceField} - ? WHERE email = ?`,
+          [payment.amount, req.merchant.email]
+        );
+        
+        // Update recipient's wallet (add)
+        await connection.execute(
+          `UPDATE wallets SET ${balanceField} = ${balanceField} + ? WHERE email = ?`,
+          [payment.amount, payment.recipient.email]
+        );
+        
+        // Create transaction record
+        const reference = generateReference();
+        const transactionPurpose = purpose || payment.note || 'Salary payment';
+        
+        await connection.execute(
+          `INSERT INTO transactions (reference, sender_email, recipient_email, amount, currency, original_amount, status, transaction_type, notes, purpose, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, 'completed', 'transfer', ?, ?, NOW())`,
+          [reference, req.merchant.email, payment.recipient.email, payment.amount, currency, payment.amount, payment.note, transactionPurpose]
+        );
+        
+        results.successful.push({
+          recipient_contact: payment.recipient.email,
+          recipient_name: `${payment.recipient.first_name} ${payment.recipient.last_name}`,
+          amount: payment.amount,
+          reference,
+          note: payment.note
+        });
+        results.total_successful++;
+        
+      } catch (err) {
+        results.failed.push({
+          recipient_contact: payment.recipient.email,
+          amount: payment.amount,
+          error: err.message,
+          note: payment.note
+        });
+        results.total_failed++;
+      }
+    }
+    
+    await connection.commit();
+    
+    // Get updated wallet balance
+    const [updatedWallet] = await pool.execute(
+      'SELECT balance, lrd_balance FROM wallets WHERE email = ?',
+      [req.merchant.email]
+    );
+    
+    res.json({
+      success: true,
+      message: `Bulk payout completed: ${results.total_successful} successful, ${results.total_failed} failed`,
+      data: {
+        summary: {
+          total_successful: results.total_successful,
+          total_failed: results.total_failed,
+          total_amount: results.total_amount,
+          currency,
+          new_balance_usd: parseFloat(updatedWallet[0].balance),
+          new_balance_lrd: parseFloat(updatedWallet[0].lrd_balance)
+        },
+        successful_transactions: results.successful,
+        failed_transactions: results.failed
+      }
+    });
+    
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Bulk payout error:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 // ============ HEALTH CHECK ============
 
 app.get('/health', (req, res) => {
