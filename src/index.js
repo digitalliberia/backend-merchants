@@ -1071,6 +1071,424 @@ app.post('/merchants/wallet/bulk-payout', requireMerchantAuth, async (req, res) 
   }
 });
 
+// ============ E-INVOICE SYSTEM ============
+
+// Generate unique invoice number
+function generateInvoiceNumber() {
+  return `INV-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+}
+
+// Lookup business by DSSN, Tax ID, or Registration Number
+app.post('/merchants/invoices/lookup-business', requireMerchantAuth, async (req, res) => {
+  const { identifier } = req.body;
+  
+  if (!identifier) {
+    return res.status(400).json({ error: 'Identifier is required (DSSN, Tax ID, or Registration Number)' });
+  }
+  
+  try {
+    // Try to find by DSSN, Tax ID, or Registration Number
+    const [merchants] = await pool.execute(
+      `SELECT DSSN, business_name, business_registration_number, tax_identification_number, 
+              email, phone_number, status
+       FROM merchants 
+       WHERE DSSN = ? OR tax_identification_number = ? OR business_registration_number = ?
+       AND status = 'active'`,
+      [identifier, identifier, identifier]
+    );
+    
+    if (merchants.length === 0) {
+      return res.status(404).json({ error: 'Business not found' });
+    }
+    
+    const merchant = merchants[0];
+    
+    res.json({
+      success: true,
+      data: {
+        dssn: merchant.DSSN,
+        business_name: merchant.business_name,
+        registration_number: merchant.business_registration_number,
+        tax_id: merchant.tax_identification_number,
+        email: merchant.email,
+        phone: merchant.phone_number
+      }
+    });
+  } catch (error) {
+    console.error('Lookup business error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Send invoice
+app.post('/merchants/invoices/send', requireMerchantAuth, async (req, res) => {
+  const { recipient_dssn, amount, currency, purpose, notes, due_date } = req.body;
+  
+  if (!recipient_dssn) {
+    return res.status(400).json({ error: 'Recipient DSSN is required' });
+  }
+  
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ error: 'Valid amount is required' });
+  }
+  
+  if (!['USD', 'LRD'].includes(currency)) {
+    return res.status(400).json({ error: 'Invalid currency' });
+  }
+  
+  let connection;
+  
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    // Get sender info
+    const [senders] = await connection.execute(
+      `SELECT DSSN, business_name, email, phone_number, tax_identification_number, business_registration_number
+       FROM merchants WHERE DSSN = ?`,
+      [req.merchant.DSSN]
+    );
+    
+    if (senders.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Sender not found' });
+    }
+    
+    const sender = senders[0];
+    
+    // Get recipient info
+    const [recipients] = await connection.execute(
+      `SELECT DSSN, business_name, email, phone_number, tax_identification_number, business_registration_number
+       FROM merchants WHERE DSSN = ? AND status = 'active'`,
+      [recipient_dssn]
+    );
+    
+    if (recipients.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Recipient business not found' });
+    }
+    
+    const recipient = recipients[0];
+    
+    // Check if sending to self
+    if (recipient.DSSN === sender.DSSN) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Cannot send invoice to yourself' });
+    }
+    
+    // Create invoice
+    const invoiceNumber = generateInvoiceNumber();
+    
+    await connection.execute(
+      `INSERT INTO merchant_invoices (
+        invoice_number, sender_dssn, sender_business_name, sender_email, sender_phone,
+        sender_tax_id, sender_reg_number, recipient_dssn, recipient_business_name,
+        recipient_email, recipient_phone, recipient_tax_id, recipient_reg_number,
+        amount, currency, purpose, notes, due_date, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [
+        invoiceNumber, sender.DSSN, sender.business_name, sender.email, sender.phone_number,
+        sender.tax_identification_number, sender.business_registration_number,
+        recipient.DSSN, recipient.business_name, recipient.email, recipient.phone_number,
+        recipient.tax_identification_number, recipient.business_registration_number,
+        amount, currency, purpose || null, notes || null, due_date || null
+      ]
+    );
+    
+    await connection.commit();
+    
+    res.json({
+      success: true,
+      message: `Invoice ${invoiceNumber} sent successfully to ${recipient.business_name}`,
+      data: {
+        invoice_number: invoiceNumber,
+        recipient: {
+          business_name: recipient.business_name,
+          dssn: recipient.DSSN,
+          email: recipient.email
+        },
+        amount,
+        currency,
+        purpose,
+        due_date
+      }
+    });
+    
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Send invoice error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// Get invoices (sent and received)
+app.get('/merchants/invoices', requireMerchantAuth, async (req, res) => {
+  const { status, type, limit = 50 } = req.query;
+  
+  try {
+    let query = `
+      SELECT 
+        id, invoice_number, sender_dssn, sender_business_name, sender_email,
+        recipient_dssn, recipient_business_name, recipient_email,
+        amount, currency, purpose, notes, status, due_date, paid_at, created_at
+      FROM merchant_invoices
+      WHERE sender_dssn = ? OR recipient_dssn = ?
+    `;
+    const params = [req.merchant.DSSN, req.merchant.DSSN];
+    
+    if (status && status !== 'all') {
+      query += ' AND status = ?';
+      params.push(status);
+    }
+    
+    if (type === 'sent') {
+      query = query.replace('WHERE sender_dssn = ? OR recipient_dssn = ?', 'WHERE sender_dssn = ?');
+      params.length = 1;
+      params[0] = req.merchant.DSSN;
+    } else if (type === 'received') {
+      query = query.replace('WHERE sender_dssn = ? OR recipient_dssn = ?', 'WHERE recipient_dssn = ?');
+      params.length = 1;
+      params[0] = req.merchant.DSSN;
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(parseInt(limit));
+    
+    const [invoices] = await pool.execute(query, params);
+    
+    // Format invoices
+    const formattedInvoices = invoices.map(inv => ({
+      id: inv.id,
+      invoice_number: inv.invoice_number,
+      direction: inv.sender_dssn === req.merchant.DSSN ? 'sent' : 'received',
+      sender: {
+        business_name: inv.sender_business_name,
+        dssn: inv.sender_dssn,
+        email: inv.sender_email
+      },
+      recipient: {
+        business_name: inv.recipient_business_name,
+        dssn: inv.recipient_dssn,
+        email: inv.recipient_email
+      },
+      amount: parseFloat(inv.amount),
+      currency: inv.currency,
+      purpose: inv.purpose,
+      notes: inv.notes,
+      status: inv.status,
+      due_date: inv.due_date,
+      paid_at: inv.paid_at,
+      created_at: inv.created_at
+    }));
+    
+    res.json({
+      success: true,
+      data: formattedInvoices
+    });
+    
+  } catch (error) {
+    console.error('Get invoices error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single invoice details
+app.get('/merchants/invoices/:invoiceNumber', requireMerchantAuth, async (req, res) => {
+  const { invoiceNumber } = req.params;
+  
+  try {
+    const [invoices] = await pool.execute(
+      `SELECT * FROM merchant_invoices WHERE invoice_number = ?`,
+      [invoiceNumber]
+    );
+    
+    if (invoices.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    const invoice = invoices[0];
+    
+    // Check if merchant is authorized to view this invoice
+    if (invoice.sender_dssn !== req.merchant.DSSN && invoice.recipient_dssn !== req.merchant.DSSN) {
+      return res.status(403).json({ error: 'Unauthorized to view this invoice' });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        id: invoice.id,
+        invoice_number: invoice.invoice_number,
+        sender: {
+          business_name: invoice.sender_business_name,
+          dssn: invoice.sender_dssn,
+          email: invoice.sender_email,
+          phone: invoice.sender_phone,
+          tax_id: invoice.sender_tax_id,
+          registration_number: invoice.sender_reg_number
+        },
+        recipient: {
+          business_name: invoice.recipient_business_name,
+          dssn: invoice.recipient_dssn,
+          email: invoice.recipient_email,
+          phone: invoice.recipient_phone,
+          tax_id: invoice.recipient_tax_id,
+          registration_number: invoice.recipient_reg_number
+        },
+        amount: parseFloat(invoice.amount),
+        currency: invoice.currency,
+        purpose: invoice.purpose,
+        notes: invoice.notes,
+        status: invoice.status,
+        due_date: invoice.due_date,
+        paid_at: invoice.paid_at,
+        created_at: invoice.created_at
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get invoice error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Pay invoice (transfer money)
+app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (req, res) => {
+  const { invoiceNumber } = req.params;
+  
+  let connection;
+  
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    // Get invoice
+    const [invoices] = await connection.execute(
+      `SELECT * FROM merchant_invoices WHERE invoice_number = ? AND status = 'pending'`,
+      [invoiceNumber]
+    );
+    
+    if (invoices.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Invoice not found or already paid' });
+    }
+    
+    const invoice = invoices[0];
+    
+    // Check if recipient is the one paying
+    if (invoice.recipient_dssn !== req.merchant.DSSN) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Only the recipient can pay this invoice' });
+    }
+    
+    // Get sender and recipient wallet balances
+    const [senderWallets] = await connection.execute(
+      'SELECT balance, lrd_balance FROM wallets WHERE email = ?',
+      [invoice.recipient_email]
+    );
+    
+    const [recipientWallets] = await connection.execute(
+      'SELECT balance, lrd_balance FROM wallets WHERE email = ?',
+      [invoice.sender_email]
+    );
+    
+    const balanceField = invoice.currency === 'USD' ? 'balance' : 'lrd_balance';
+    const currentBalance = parseFloat(senderWallets[0][balanceField]);
+    
+    if (currentBalance < invoice.amount) {
+      await connection.rollback();
+      return res.status(400).json({ error: `Insufficient ${invoice.currency} balance to pay invoice` });
+    }
+    
+    // Transfer money
+    await connection.execute(
+      `UPDATE wallets SET ${balanceField} = ${balanceField} - ? WHERE email = ?`,
+      [invoice.amount, invoice.recipient_email]
+    );
+    
+    await connection.execute(
+      `UPDATE wallets SET ${balanceField} = ${balanceField} + ? WHERE email = ?`,
+      [invoice.amount, invoice.sender_email]
+    );
+    
+    // Create transaction record
+    const reference = generateReference();
+    const transactionPurpose = `Invoice payment: ${invoice.invoice_number} - ${invoice.purpose || 'Invoice payment'}`;
+    
+    await connection.execute(
+      `INSERT INTO transactions (reference, sender_email, recipient_email, amount, currency, original_amount, status, transaction_type, notes, purpose, created_at) 
+       VALUES (?, ?, ?, ?, ?, ?, 'completed', 'payment', ?, ?, NOW())`,
+      [reference, invoice.recipient_email, invoice.sender_email, invoice.amount, invoice.currency, invoice.amount, `Payment for invoice ${invoice.invoice_number}`, transactionPurpose]
+    );
+    
+    // Update invoice status
+    await connection.execute(
+      `UPDATE merchant_invoices SET status = 'paid', paid_at = NOW() WHERE invoice_number = ?`,
+      [invoiceNumber]
+    );
+    
+    await connection.commit();
+    
+    res.json({
+      success: true,
+      message: `Invoice ${invoiceNumber} paid successfully`,
+      data: {
+        invoice_number: invoiceNumber,
+        amount: invoice.amount,
+        currency: invoice.currency,
+        transaction_reference: reference,
+        paid_at: new Date().toISOString()
+      }
+    });
+    
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Pay invoice error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// Cancel invoice (only sender can cancel)
+app.post('/merchants/invoices/:invoiceNumber/cancel', requireMerchantAuth, async (req, res) => {
+  const { invoiceNumber } = req.params;
+  const { reason } = req.body;
+  
+  try {
+    const [invoices] = await pool.execute(
+      `SELECT * FROM merchant_invoices WHERE invoice_number = ? AND status = 'pending'`,
+      [invoiceNumber]
+    );
+    
+    if (invoices.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found or already processed' });
+    }
+    
+    const invoice = invoices[0];
+    
+    // Only sender can cancel
+    if (invoice.sender_dssn !== req.merchant.DSSN) {
+      return res.status(403).json({ error: 'Only the sender can cancel this invoice' });
+    }
+    
+    await pool.execute(
+      `UPDATE merchant_invoices SET status = 'cancelled' WHERE invoice_number = ?`,
+      [invoiceNumber]
+    );
+    
+    res.json({
+      success: true,
+      message: `Invoice ${invoiceNumber} cancelled successfully`
+    });
+    
+  } catch (error) {
+    console.error('Cancel invoice error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============ HEALTH CHECK ============
 
 app.get('/health', (req, res) => {
