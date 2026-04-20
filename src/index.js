@@ -1508,6 +1508,509 @@ app.get('/merchants/analytics', requireMerchantAuth, async (req, res) => {
   }
 });
 
+// ============ STORE MANAGEMENT ENDPOINTS ============
+
+// Create products table if not exists
+async function initStoreTables() {
+  const createProductsTable = `
+    CREATE TABLE IF NOT EXISTS merchant_products (
+      id INT PRIMARY KEY AUTO_INCREMENT,
+      merchant_dssn VARCHAR(50) NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      description TEXT,
+      price_usd DECIMAL(10,2) DEFAULT 0.00,
+      price_lrd DECIMAL(10,2) DEFAULT 0.00,
+      stock INT DEFAULT 0,
+      category VARCHAR(100),
+      sub_category VARCHAR(100),
+      product_type ENUM('physical', 'digital', 'service', 'food', 'ride') DEFAULT 'physical',
+      image_url VARCHAR(500),
+      images JSON,
+      status ENUM('active', 'inactive') DEFAULT 'active',
+      featured BOOLEAN DEFAULT FALSE,
+      sales_count INT DEFAULT 0,
+      rating DECIMAL(2,1) DEFAULT 0,
+      reviews_count INT DEFAULT 0,
+      metadata JSON,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (merchant_dssn) REFERENCES merchants(DSSN) ON DELETE CASCADE,
+      INDEX idx_merchant (merchant_dssn),
+      INDEX idx_category (category),
+      INDEX idx_status (status),
+      INDEX idx_type (product_type),
+      FULLTEXT INDEX idx_search (name, description)
+    );
+  `;
+
+  const createOrdersTable = `
+    CREATE TABLE IF NOT EXISTS merchant_orders (
+      id INT PRIMARY KEY AUTO_INCREMENT,
+      order_number VARCHAR(50) UNIQUE NOT NULL,
+      merchant_dssn VARCHAR(50) NOT NULL,
+      customer_id INT,
+      customer_name VARCHAR(255),
+      customer_email VARCHAR(255),
+      customer_phone VARCHAR(20),
+      customer_address TEXT,
+      items JSON NOT NULL,
+      subtotal_usd DECIMAL(10,2) DEFAULT 0.00,
+      subtotal_lrd DECIMAL(10,2) DEFAULT 0.00,
+      tax_usd DECIMAL(10,2) DEFAULT 0.00,
+      tax_lrd DECIMAL(10,2) DEFAULT 0.00,
+      delivery_fee_usd DECIMAL(10,2) DEFAULT 0.00,
+      delivery_fee_lrd DECIMAL(10,2) DEFAULT 0.00,
+      total_usd DECIMAL(10,2) DEFAULT 0.00,
+      total_lrd DECIMAL(10,2) DEFAULT 0.00,
+      currency ENUM('USD', 'LRD') DEFAULT 'USD',
+      status ENUM('pending', 'processing', 'completed', 'cancelled', 'refunded') DEFAULT 'pending',
+      payment_status ENUM('pending', 'paid', 'failed', 'refunded') DEFAULT 'pending',
+      payment_method VARCHAR(50),
+      delivery_status ENUM('pending', 'preparing', 'ready', 'delivered', 'cancelled') DEFAULT 'pending',
+      delivery_address TEXT,
+      delivery_lat DECIMAL(10,8),
+      delivery_lng DECIMAL(11,8),
+      rider_id INT,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (merchant_dssn) REFERENCES merchants(DSSN) ON DELETE CASCADE,
+      INDEX idx_merchant (merchant_dssn),
+      INDEX idx_status (status),
+      INDEX idx_order_number (order_number),
+      INDEX idx_customer (customer_email)
+    );
+  `;
+
+  const createRidersTable = `
+    CREATE TABLE IF NOT EXISTS merchant_riders (
+      id INT PRIMARY KEY AUTO_INCREMENT,
+      merchant_dssn VARCHAR(50) NOT NULL,
+      rider_name VARCHAR(255) NOT NULL,
+      rider_phone VARCHAR(20) NOT NULL,
+      rider_email VARCHAR(255),
+      vehicle_type VARCHAR(50),
+      vehicle_plate VARCHAR(50),
+      status ENUM('active', 'inactive', 'busy') DEFAULT 'active',
+      current_lat DECIMAL(10,8),
+      current_lng DECIMAL(11,8),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (merchant_dssn) REFERENCES merchants(DSSN) ON DELETE CASCADE
+    );
+  `;
+
+  try {
+    await pool.execute(createProductsTable);
+    console.log('✅ merchant_products table ready');
+  } catch (err) {
+    console.log('⚠️ merchant_products table error:', err.message);
+  }
+
+  try {
+    await pool.execute(createOrdersTable);
+    console.log('✅ merchant_orders table ready');
+  } catch (err) {
+    console.log('⚠️ merchant_orders table error:', err.message);
+  }
+
+  try {
+    await pool.execute(createRidersTable);
+    console.log('✅ merchant_riders table ready');
+  } catch (err) {
+    console.log('⚠️ merchant_riders table error:', err.message);
+  }
+}
+
+// Call this in initDatabase after pool is created
+// Add this line to your initDatabase function after creating other tables:
+// await initStoreTables();
+
+// ============ PRODUCT ENDPOINTS ============
+
+// Get all products
+app.get('/merchants/store/products', requireMerchantAuth, async (req, res) => {
+  const { limit = 100, offset = 0, category, status, type, search } = req.query;
+  const limitNum = parseInt(limit) || 100;
+  const offsetNum = parseInt(offset) || 0;
+  
+  try {
+    let query = `
+      SELECT id, name, description, price_usd, price_lrd, stock, category, sub_category,
+             product_type, image_url, images, status, featured, sales_count, rating, 
+             reviews_count, metadata, created_at
+      FROM merchant_products
+      WHERE merchant_dssn = ?
+    `;
+    const params = [req.merchant.DSSN];
+    
+    if (category && category !== 'all') {
+      query += ' AND category = ?';
+      params.push(category);
+    }
+    
+    if (status && status !== 'all') {
+      query += ' AND status = ?';
+      params.push(status);
+    }
+    
+    if (type && type !== 'all') {
+      query += ' AND product_type = ?';
+      params.push(type);
+    }
+    
+    if (search) {
+      query += ' AND (name LIKE ? OR description LIKE ?)';
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(limitNum, offsetNum);
+    
+    const [products] = await pool.query(query, params);
+    
+    res.json({
+      success: true,
+      data: products.map(p => ({
+        ...p,
+        price_usd: parseFloat(p.price_usd),
+        price_lrd: parseFloat(p.price_lrd)
+      }))
+    });
+  } catch (error) {
+    console.error('Get products error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single product
+app.get('/merchants/store/products/:productId', requireMerchantAuth, async (req, res) => {
+  const { productId } = req.params;
+  
+  try {
+    const [products] = await pool.execute(
+      `SELECT id, name, description, price_usd, price_lrd, stock, category, sub_category,
+              product_type, image_url, images, status, featured, sales_count, rating,
+              reviews_count, metadata, created_at
+       FROM merchant_products
+       WHERE id = ? AND merchant_dssn = ?`,
+      [productId, req.merchant.DSSN]
+    );
+    
+    if (products.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        ...products[0],
+        price_usd: parseFloat(products[0].price_usd),
+        price_lrd: parseFloat(products[0].price_lrd)
+      }
+    });
+  } catch (error) {
+    console.error('Get product error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add product
+app.post('/merchants/store/products', requireMerchantAuth, async (req, res) => {
+  const {
+    name, description, price_usd, price_lrd, stock, category, sub_category,
+    product_type, image_url, images, status, featured, metadata
+  } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ error: 'Product name is required' });
+  }
+  
+  try {
+    const [result] = await pool.execute(
+      `INSERT INTO merchant_products (
+        merchant_dssn, name, description, price_usd, price_lrd, stock, category,
+        sub_category, product_type, image_url, images, status, featured, metadata
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.merchant.DSSN, name, description || null, price_usd || 0, price_lrd || 0,
+        stock || 0, category || null, sub_category || null, product_type || 'physical',
+        image_url || null, images ? JSON.stringify(images) : null,
+        status || 'active', featured || false, metadata ? JSON.stringify(metadata) : null
+      ]
+    );
+    
+    res.json({
+      success: true,
+      message: 'Product added successfully',
+      data: { id: result.insertId }
+    });
+  } catch (error) {
+    console.error('Add product error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update product
+app.put('/merchants/store/products/:productId', requireMerchantAuth, async (req, res) => {
+  const { productId } = req.params;
+  const updates = [];
+  const params = [];
+  
+  const allowedFields = [
+    'name', 'description', 'price_usd', 'price_lrd', 'stock', 'category',
+    'sub_category', 'product_type', 'image_url', 'images', 'status', 'featured', 'metadata'
+  ];
+  
+  for (const field of allowedFields) {
+    if (req.body[field] !== undefined) {
+      updates.push(`${field} = ?`);
+      if (field === 'images' || field === 'metadata') {
+        params.push(JSON.stringify(req.body[field]));
+      } else {
+        params.push(req.body[field]);
+      }
+    }
+  }
+  
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No fields to update' });
+  }
+  
+  params.push(productId, req.merchant.DSSN);
+  
+  try {
+    await pool.execute(
+      `UPDATE merchant_products SET ${updates.join(', ')} WHERE id = ? AND merchant_dssn = ?`,
+      params
+    );
+    
+    res.json({ success: true, message: 'Product updated successfully' });
+  } catch (error) {
+    console.error('Update product error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete product
+app.delete('/merchants/store/products/:productId', requireMerchantAuth, async (req, res) => {
+  const { productId } = req.params;
+  
+  try {
+    await pool.execute(
+      'DELETE FROM merchant_products WHERE id = ? AND merchant_dssn = ?',
+      [productId, req.merchant.DSSN]
+    );
+    
+    res.json({ success: true, message: 'Product deleted successfully' });
+  } catch (error) {
+    console.error('Delete product error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ ORDER ENDPOINTS ============
+
+// Get all orders
+app.get('/merchants/store/orders', requireMerchantAuth, async (req, res) => {
+  const { limit = 50, offset = 0, status, payment_status, delivery_status } = req.query;
+  const limitNum = parseInt(limit) || 50;
+  const offsetNum = parseInt(offset) || 0;
+  
+  try {
+    let query = `
+      SELECT id, order_number, customer_name, customer_email, customer_phone,
+             items, subtotal_usd, subtotal_lrd, tax_usd, tax_lrd,
+             delivery_fee_usd, delivery_fee_lrd, total_usd, total_lrd,
+             currency, status, payment_status, payment_method,
+             delivery_status, delivery_address, notes, created_at
+      FROM merchant_orders
+      WHERE merchant_dssn = ?
+    `;
+    const params = [req.merchant.DSSN];
+    
+    if (status && status !== 'all') {
+      query += ' AND status = ?';
+      params.push(status);
+    }
+    
+    if (payment_status && payment_status !== 'all') {
+      query += ' AND payment_status = ?';
+      params.push(payment_status);
+    }
+    
+    if (delivery_status && delivery_status !== 'all') {
+      query += ' AND delivery_status = ?';
+      params.push(delivery_status);
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(limitNum, offsetNum);
+    
+    const [orders] = await pool.query(query, params);
+    
+    res.json({
+      success: true,
+      data: orders.map(o => ({
+        ...o,
+        subtotal_usd: parseFloat(o.subtotal_usd),
+        subtotal_lrd: parseFloat(o.subtotal_lrd),
+        total_usd: parseFloat(o.total_usd),
+        total_lrd: parseFloat(o.total_lrd),
+        items: typeof o.items === 'string' ? JSON.parse(o.items) : o.items
+      }))
+    });
+  } catch (error) {
+    console.error('Get orders error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single order
+app.get('/merchants/store/orders/:orderNumber', requireMerchantAuth, async (req, res) => {
+  const { orderNumber } = req.params;
+  
+  try {
+    const [orders] = await pool.execute(
+      `SELECT * FROM merchant_orders WHERE order_number = ? AND merchant_dssn = ?`,
+      [orderNumber, req.merchant.DSSN]
+    );
+    
+    if (orders.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        ...orders[0],
+        subtotal_usd: parseFloat(orders[0].subtotal_usd),
+        subtotal_lrd: parseFloat(orders[0].subtotal_lrd),
+        total_usd: parseFloat(orders[0].total_usd),
+        total_lrd: parseFloat(orders[0].total_lrd),
+        items: typeof orders[0].items === 'string' ? JSON.parse(orders[0].items) : orders[0].items
+      }
+    });
+  } catch (error) {
+    console.error('Get order error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update order status
+app.put('/merchants/store/orders/:orderNumber/status', requireMerchantAuth, async (req, res) => {
+  const { orderNumber } = req.params;
+  const { status, payment_status, delivery_status } = req.body;
+  
+  try {
+    const updates = [];
+    const params = [];
+    
+    if (status) {
+      updates.push('status = ?');
+      params.push(status);
+    }
+    if (payment_status) {
+      updates.push('payment_status = ?');
+      params.push(payment_status);
+    }
+    if (delivery_status) {
+      updates.push('delivery_status = ?');
+      params.push(delivery_status);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    params.push(orderNumber, req.merchant.DSSN);
+    
+    await pool.execute(
+      `UPDATE merchant_orders SET ${updates.join(', ')} WHERE order_number = ? AND merchant_dssn = ?`,
+      params
+    );
+    
+    res.json({ success: true, message: 'Order updated successfully' });
+  } catch (error) {
+    console.error('Update order error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ CATEGORIES ENDPOINT ============
+
+// Get unique categories for merchant
+app.get('/merchants/store/categories', requireMerchantAuth, async (req, res) => {
+  try {
+    const [categories] = await pool.execute(
+      `SELECT DISTINCT category FROM merchant_products WHERE merchant_dssn = ? AND category IS NOT NULL`,
+      [req.merchant.DSSN]
+    );
+    
+    res.json({
+      success: true,
+      data: categories.map(c => c.category)
+    });
+  } catch (error) {
+    console.error('Get categories error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ STORE STATS ENDPOINT ============
+
+app.get('/merchants/store/stats', requireMerchantAuth, async (req, res) => {
+  try {
+    const [productStats] = await pool.execute(
+      `SELECT 
+        COUNT(*) as total_products,
+        SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active_products,
+        SUM(stock) as total_stock,
+        SUM(sales_count) as total_sales
+       FROM merchant_products
+       WHERE merchant_dssn = ?`,
+      [req.merchant.DSSN]
+    );
+    
+    const [orderStats] = await pool.execute(
+      `SELECT 
+        COUNT(*) as total_orders,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_orders,
+        SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing_orders,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_orders,
+        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_orders,
+        COALESCE(SUM(total_usd), 0) as total_revenue_usd,
+        COALESCE(SUM(total_lrd), 0) as total_revenue_lrd
+       FROM merchant_orders
+       WHERE merchant_dssn = ?`,
+      [req.merchant.DSSN]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        products: {
+          total: productStats[0]?.total_products || 0,
+          active: productStats[0]?.active_products || 0,
+          total_stock: productStats[0]?.total_stock || 0,
+          total_sales: productStats[0]?.total_sales || 0
+        },
+        orders: {
+          total: orderStats[0]?.total_orders || 0,
+          pending: orderStats[0]?.pending_orders || 0,
+          processing: orderStats[0]?.processing_orders || 0,
+          completed: orderStats[0]?.completed_orders || 0,
+          cancelled: orderStats[0]?.cancelled_orders || 0,
+          total_revenue_usd: parseFloat(orderStats[0]?.total_revenue_usd || 0),
+          total_revenue_lrd: parseFloat(orderStats[0]?.total_revenue_lrd || 0)
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get store stats error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============ HEALTH CHECK ============
 
 app.get('/health', (req, res) => {
