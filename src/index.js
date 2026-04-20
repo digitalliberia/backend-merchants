@@ -1071,7 +1071,7 @@ app.post('/merchants/wallet/bulk-payout', requireMerchantAuth, async (req, res) 
   }
 });
 
-// ============ E-INVOICE SYSTEM ============
+// ============ E-INVOICE SYSTEM (COMPLETE WORKING VERSION) ============
 
 // Generate unique invoice number
 function generateInvoiceNumber() {
@@ -1083,17 +1083,15 @@ app.post('/merchants/invoices/lookup-business', requireMerchantAuth, async (req,
   const { identifier } = req.body;
   
   if (!identifier) {
-    return res.status(400).json({ error: 'Identifier is required (DSSN, Tax ID, or Registration Number)' });
+    return res.status(400).json({ error: 'Identifier is required' });
   }
   
   try {
-    // Try to find by DSSN, Tax ID, or Registration Number
     const [merchants] = await pool.execute(
       `SELECT DSSN, business_name, business_registration_number, tax_identification_number, 
               email, phone_number, status
        FROM merchants 
-       WHERE DSSN = ? OR tax_identification_number = ? OR business_registration_number = ?
-       AND status = 'active'`,
+       WHERE DSSN = ? OR tax_identification_number = ? OR business_registration_number = ?`,
       [identifier, identifier, identifier]
     );
     
@@ -1102,6 +1100,10 @@ app.post('/merchants/invoices/lookup-business', requireMerchantAuth, async (req,
     }
     
     const merchant = merchants[0];
+    
+    if (merchant.status !== 'active') {
+      return res.status(403).json({ error: 'Business account is not active' });
+    }
     
     res.json({
       success: true,
@@ -1223,15 +1225,18 @@ app.post('/merchants/invoices/send', requireMerchantAuth, async (req, res) => {
   }
 });
 
-// Get invoices (sent and received)
+// Get invoices (FIXED VERSION - uses query instead of execute)
 app.get('/merchants/invoices', requireMerchantAuth, async (req, res) => {
   const { status, type, limit = 50 } = req.query;
+  const limitNum = parseInt(limit) || 50;
   
   try {
     let query = `
       SELECT 
         id, invoice_number, sender_dssn, sender_business_name, sender_email,
+        sender_phone, sender_tax_id, sender_reg_number,
         recipient_dssn, recipient_business_name, recipient_email,
+        recipient_phone, recipient_tax_id, recipient_reg_number,
         amount, currency, purpose, notes, status, due_date, paid_at, created_at
       FROM merchant_invoices
       WHERE sender_dssn = ? OR recipient_dssn = ?
@@ -1244,21 +1249,49 @@ app.get('/merchants/invoices', requireMerchantAuth, async (req, res) => {
     }
     
     if (type === 'sent') {
-      query = query.replace('WHERE sender_dssn = ? OR recipient_dssn = ?', 'WHERE sender_dssn = ?');
+      query = `
+        SELECT 
+          id, invoice_number, sender_dssn, sender_business_name, sender_email,
+          sender_phone, sender_tax_id, sender_reg_number,
+          recipient_dssn, recipient_business_name, recipient_email,
+          recipient_phone, recipient_tax_id, recipient_reg_number,
+          amount, currency, purpose, notes, status, due_date, paid_at, created_at
+        FROM merchant_invoices
+        WHERE sender_dssn = ?
+      `;
       params.length = 1;
       params[0] = req.merchant.DSSN;
+      
+      if (status && status !== 'all') {
+        query += ' AND status = ?';
+        params.push(status);
+      }
     } else if (type === 'received') {
-      query = query.replace('WHERE sender_dssn = ? OR recipient_dssn = ?', 'WHERE recipient_dssn = ?');
+      query = `
+        SELECT 
+          id, invoice_number, sender_dssn, sender_business_name, sender_email,
+          sender_phone, sender_tax_id, sender_reg_number,
+          recipient_dssn, recipient_business_name, recipient_email,
+          recipient_phone, recipient_tax_id, recipient_reg_number,
+          amount, currency, purpose, notes, status, due_date, paid_at, created_at
+        FROM merchant_invoices
+        WHERE recipient_dssn = ?
+      `;
       params.length = 1;
       params[0] = req.merchant.DSSN;
+      
+      if (status && status !== 'all') {
+        query += ' AND status = ?';
+        params.push(status);
+      }
     }
     
     query += ' ORDER BY created_at DESC LIMIT ?';
-    params.push(parseInt(limit));
+    params.push(limitNum);
     
-    const [invoices] = await pool.execute(query, params);
+    // Use query() instead of execute() to avoid parameter binding issues with LIMIT
+    const [invoices] = await pool.query(query, params);
     
-    // Format invoices
     const formattedInvoices = invoices.map(inv => ({
       id: inv.id,
       invoice_number: inv.invoice_number,
@@ -1353,7 +1386,7 @@ app.get('/merchants/invoices/:invoiceNumber', requireMerchantAuth, async (req, r
   }
 });
 
-// Pay invoice (transfer money)
+// Pay invoice
 app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (req, res) => {
   const { invoiceNumber } = req.params;
   
@@ -1363,7 +1396,6 @@ app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (r
     connection = await pool.getConnection();
     await connection.beginTransaction();
     
-    // Get invoice
     const [invoices] = await connection.execute(
       `SELECT * FROM merchant_invoices WHERE invoice_number = ? AND status = 'pending'`,
       [invoiceNumber]
@@ -1376,13 +1408,11 @@ app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (r
     
     const invoice = invoices[0];
     
-    // Check if recipient is the one paying
     if (invoice.recipient_dssn !== req.merchant.DSSN) {
       await connection.rollback();
       return res.status(403).json({ error: 'Only the recipient can pay this invoice' });
     }
     
-    // Get sender and recipient wallet balances
     const [senderWallets] = await connection.execute(
       'SELECT balance, lrd_balance FROM wallets WHERE email = ?',
       [invoice.recipient_email]
@@ -1401,7 +1431,6 @@ app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (r
       return res.status(400).json({ error: `Insufficient ${invoice.currency} balance to pay invoice` });
     }
     
-    // Transfer money
     await connection.execute(
       `UPDATE wallets SET ${balanceField} = ${balanceField} - ? WHERE email = ?`,
       [invoice.amount, invoice.recipient_email]
@@ -1412,7 +1441,6 @@ app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (r
       [invoice.amount, invoice.sender_email]
     );
     
-    // Create transaction record
     const reference = generateReference();
     const transactionPurpose = `Invoice payment: ${invoice.invoice_number} - ${invoice.purpose || 'Invoice payment'}`;
     
@@ -1422,7 +1450,6 @@ app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (r
       [reference, invoice.recipient_email, invoice.sender_email, invoice.amount, invoice.currency, invoice.amount, `Payment for invoice ${invoice.invoice_number}`, transactionPurpose]
     );
     
-    // Update invoice status
     await connection.execute(
       `UPDATE merchant_invoices SET status = 'paid', paid_at = NOW() WHERE invoice_number = ?`,
       [invoiceNumber]
@@ -1451,7 +1478,7 @@ app.post('/merchants/invoices/:invoiceNumber/pay', requireMerchantAuth, async (r
   }
 });
 
-// Cancel invoice (only sender can cancel)
+// Cancel invoice
 app.post('/merchants/invoices/:invoiceNumber/cancel', requireMerchantAuth, async (req, res) => {
   const { invoiceNumber } = req.params;
   const { reason } = req.body;
@@ -1468,7 +1495,6 @@ app.post('/merchants/invoices/:invoiceNumber/cancel', requireMerchantAuth, async
     
     const invoice = invoices[0];
     
-    // Only sender can cancel
     if (invoice.sender_dssn !== req.merchant.DSSN) {
       return res.status(403).json({ error: 'Only the sender can cancel this invoice' });
     }
