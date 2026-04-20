@@ -551,6 +551,41 @@ app.get('/merchants/wallet/transactions', requireMerchantAuth, async (req, res) 
   }
 });
 
+// ============ BUSINESS STATISTICS ============
+
+app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
+  try {
+    const [salesStats] = await pool.execute(
+      `SELECT 
+        COALESCE(SUM(CASE WHEN currency = 'USD' THEN amount ELSE 0 END), 0) as total_sales_usd,
+        COALESCE(SUM(CASE WHEN currency = 'LRD' THEN amount ELSE 0 END), 0) as total_sales_lrd,
+        COUNT(*) as total_transactions
+       FROM transactions
+       WHERE recipient_email = ? AND status = 'completed'`,
+      [req.merchant.email]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        total_sales: parseFloat(salesStats[0]?.total_sales_usd || 0),
+        total_sales_lrd: parseFloat(salesStats[0]?.total_sales_lrd || 0),
+        total_transactions: parseInt(salesStats[0]?.total_transactions || 0),
+        average_order_value: salesStats[0]?.total_transactions > 0 
+          ? parseFloat(salesStats[0]?.total_sales_usd / salesStats[0]?.total_transactions) 
+          : 0,
+        monthly_growth: 0,
+        pending_orders: 0,
+        completed_orders: parseInt(salesStats[0]?.total_transactions || 0),
+        top_customers: 0
+      }
+    });
+  } catch (error) {
+    console.error('Get stats error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============ BUSINESS ANALYTICS ENDPOINT ============
 
 app.get('/merchants/analytics', requireMerchantAuth, async (req, res) => {
