@@ -551,37 +551,181 @@ app.get('/merchants/wallet/transactions', requireMerchantAuth, async (req, res) 
   }
 });
 
-// ============ BUSINESS STATISTICS ============
+// ============ BUSINESS ANALYTICS ENDPOINT ============
 
-app.get('/merchants/stats', requireMerchantAuth, async (req, res) => {
+app.get('/merchants/analytics', requireMerchantAuth, async (req, res) => {
   try {
-    const [salesStats] = await pool.execute(
+    const merchantEmail = req.merchant.email;
+    
+    // Get all transactions
+    const [transactions] = await pool.query(
       `SELECT 
-        COALESCE(SUM(CASE WHEN currency = 'USD' THEN amount ELSE 0 END), 0) as total_sales_usd,
-        COALESCE(SUM(CASE WHEN currency = 'LRD' THEN amount ELSE 0 END), 0) as total_sales_lrd,
-        COUNT(*) as total_transactions
-       FROM transactions
-       WHERE recipient_email = ? AND status = 'completed'`,
-      [req.merchant.email]
+        amount,
+        currency,
+        status,
+        transaction_type as type,
+        notes as description,
+        purpose,
+        created_at,
+        sender_email,
+        recipient_email
+      FROM transactions
+      WHERE sender_email = ? OR recipient_email = ?
+      ORDER BY created_at DESC`,
+      [merchantEmail, merchantEmail]
     );
+    
+    // Calculate totals
+    let total_received_usd = 0;
+    let total_received_lrd = 0;
+    let total_sent_usd = 0;
+    let total_sent_lrd = 0;
+    let salary_payouts_usd = 0;
+    let salary_payouts_lrd = 0;
+    let total_transactions = 0;
+    let completed_transactions = 0;
+    
+    // Monthly data for charts
+    const monthlyData = new Map();
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    
+    // Track unique customers
+    const customerMap = new Map();
+    
+    for (const tx of transactions) {
+      total_transactions++;
+      if (tx.status === 'completed') completed_transactions++;
+      
+      const date = new Date(tx.created_at);
+      const monthKey = months[date.getMonth()];
+      const yearMonth = `${date.getFullYear()}-${date.getMonth() + 1}`;
+      
+      if (!monthlyData.has(yearMonth)) {
+        monthlyData.set(yearMonth, { month: monthKey, received_usd: 0, received_lrd: 0, sent_usd: 0, sent_lrd: 0 });
+      }
+      
+      const isReceived = tx.recipient_email === merchantEmail;
+      const amount = parseFloat(tx.amount);
+      
+      if (isReceived && tx.status === 'completed') {
+        if (tx.currency === 'USD') {
+          total_received_usd += amount;
+          monthlyData.get(yearMonth).received_usd += amount;
+        } else {
+          total_received_lrd += amount;
+          monthlyData.get(yearMonth).received_lrd += amount;
+        }
+        
+        // Track customer
+        const customerEmail = tx.sender_email;
+        if (!customerMap.has(customerEmail)) {
+          customerMap.set(customerEmail, { email: customerEmail, total_usd: 0, total_lrd: 0 });
+        }
+        const customer = customerMap.get(customerEmail);
+        if (tx.currency === 'USD') {
+          customer.total_usd += amount;
+        } else {
+          customer.total_lrd += amount;
+        }
+      } else if (!isReceived && tx.status === 'completed') {
+        if (tx.currency === 'USD') {
+          total_sent_usd += amount;
+          monthlyData.get(yearMonth).sent_usd += amount;
+        } else {
+          total_sent_lrd += amount;
+          monthlyData.get(yearMonth).sent_lrd += amount;
+        }
+        
+        // Check if this is a salary payout
+        if (tx.purpose && (tx.purpose.toLowerCase().includes('salary') || tx.purpose.toLowerCase().includes('payroll'))) {
+          if (tx.currency === 'USD') {
+            salary_payouts_usd += amount;
+          } else {
+            salary_payouts_lrd += amount;
+          }
+        }
+      }
+    }
+    
+    // Calculate growth (compare last 30 days with previous 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const sixtyDaysAgo = new Date();
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+    
+    const [recentStats] = await pool.query(
+      `SELECT 
+        COALESCE(SUM(CASE WHEN currency = 'USD' THEN amount ELSE 0 END), 0) as recent_usd,
+        COALESCE(SUM(CASE WHEN currency = 'LRD' THEN amount ELSE 0 END), 0) as recent_lrd
+      FROM transactions
+      WHERE recipient_email = ? AND status = 'completed' AND created_at >= ?`,
+      [merchantEmail, thirtyDaysAgo]
+    );
+    
+    const [previousStats] = await pool.query(
+      `SELECT 
+        COALESCE(SUM(CASE WHEN currency = 'USD' THEN amount ELSE 0 END), 0) as previous_usd,
+        COALESCE(SUM(CASE WHEN currency = 'LRD' THEN amount ELSE 0 END), 0) as previous_lrd
+      FROM transactions
+      WHERE recipient_email = ? AND status = 'completed' AND created_at BETWEEN ? AND ?`,
+      [merchantEmail, sixtyDaysAgo, thirtyDaysAgo]
+    );
+    
+    const recentTotal = parseFloat(recentStats[0].recent_usd) + (parseFloat(recentStats[0].recent_lrd) / 200);
+    const previousTotal = parseFloat(previousStats[0].previous_usd) + (parseFloat(previousStats[0].previous_lrd) / 200);
+    const monthlyGrowth = previousTotal > 0 ? ((recentTotal - previousTotal) / previousTotal) * 100 : recentTotal > 0 ? 100 : 0;
+    
+    // Prepare monthly chart data (last 6 months)
+    const monthlyChartData = [];
+    const now = new Date();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const yearMonth = `${d.getFullYear()}-${d.getMonth() + 1}`;
+      const data = monthlyData.get(yearMonth) || { received_usd: 0, received_lrd: 0, sent_usd: 0, sent_lrd: 0 };
+      monthlyChartData.push({
+        month: months[d.getMonth()],
+        received_usd: data.received_usd,
+        received_lrd: data.received_lrd,
+        sent_usd: data.sent_usd,
+        sent_lrd: data.sent_lrd
+      });
+    }
+    
+    // Get top customers
+    const topCustomers = Array.from(customerMap.entries())
+      .map(([email, data]) => ({
+        name: email.split('@')[0],
+        email: email,
+        total_spent_usd: data.total_usd,
+        total_spent_lrd: data.total_lrd
+      }))
+      .sort((a, b) => (b.total_spent_usd + b.total_spent_lrd / 200) - (a.total_spent_usd + a.total_spent_lrd / 200))
+      .slice(0, 10);
     
     res.json({
       success: true,
       data: {
-        total_sales: parseFloat(salesStats[0]?.total_sales_usd || 0),
-        total_sales_lrd: parseFloat(salesStats[0]?.total_sales_lrd || 0),
-        total_transactions: parseInt(salesStats[0]?.total_transactions || 0),
-        average_order_value: salesStats[0]?.total_transactions > 0 
-          ? parseFloat(salesStats[0]?.total_sales_usd / salesStats[0]?.total_transactions) 
-          : 0,
-        monthly_growth: 0,
-        pending_orders: 0,
-        completed_orders: parseInt(salesStats[0]?.total_transactions || 0),
-        top_customers: 0
+        summary: {
+          total_received_usd,
+          total_received_lrd,
+          total_sent_usd,
+          total_sent_lrd,
+          salary_payouts_usd,
+          salary_payouts_lrd,
+          total_transactions,
+          completed_transactions,
+          pending_transactions: total_transactions - completed_transactions,
+          monthly_growth: Math.round(monthlyGrowth * 10) / 10
+        },
+        monthly_data: monthlyChartData,
+        top_customers: topCustomers,
+        average_order_value_usd: total_received_usd / (transactions.filter(t => t.recipient_email === merchantEmail && t.status === 'completed').length || 1),
+        average_order_value_lrd: total_received_lrd / (transactions.filter(t => t.recipient_email === merchantEmail && t.status === 'completed').length || 1)
       }
     });
+    
   } catch (error) {
-    console.error('Get stats error:', error);
+    console.error('Analytics error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
