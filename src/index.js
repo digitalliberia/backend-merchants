@@ -1508,6 +1508,144 @@ app.get('/merchants/analytics', requireMerchantAuth, async (req, res) => {
   }
 });
 
+// ============ IMAGE UPLOAD SYSTEM ============
+
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+// Ensure upload directories exist
+const uploadDir = '/home/digitalliberia1/backend/uploads/products';
+const kycDir = '/home/digitalliberia1/backend/uploads/kyc';
+
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+if (!fs.existsSync(kycDir)) {
+  fs.mkdirSync(kycDir, { recursive: true });
+}
+
+// Configure multer for product images
+const productStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    cb(null, 'product-' + uniqueSuffix + ext);
+  }
+});
+
+// Configure multer for KYC documents
+const kycStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, kycDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    cb(null, 'kyc-doc-' + uniqueSuffix + ext);
+  }
+});
+
+// File filter for images
+const imageFilter = (req, file, cb) => {
+  const allowedTypes = /jpeg|jpg|png|gif|webp/;
+  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+  const mimetype = allowedTypes.test(file.mimetype);
+  
+  if (mimetype && extname) {
+    return cb(null, true);
+  } else {
+    cb(new Error('Only image files are allowed'));
+  }
+};
+
+const productUpload = multer({ 
+  storage: productStorage, 
+  fileFilter: imageFilter,
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+});
+
+const kycUpload = multer({ 
+  storage: kycStorage, 
+  fileFilter: imageFilter,
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
+
+// Upload product image
+app.post('/merchants/store/upload-image', requireMerchantAuth, productUpload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    const API_BASE_URL = process.env.API_BASE_URL || 'https://api.liberianpost.com';
+    const imageUrl = `${API_BASE_URL}/uploads/products/${req.file.filename}`;
+    
+    res.json({
+      success: true,
+      data: {
+        image_url: imageUrl,
+        filename: req.file.filename,
+        size: req.file.size
+      }
+    });
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({ error: 'Failed to upload image' });
+  }
+});
+
+// Upload multiple product images
+app.post('/merchants/store/upload-images', requireMerchantAuth, productUpload.array('images', 10), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+    
+    const API_BASE_URL = process.env.API_BASE_URL || 'https://api.liberianpost.com';
+    const imageUrls = req.files.map(file => ({
+      url: `${API_BASE_URL}/uploads/products/${file.filename}`,
+      filename: file.filename
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        images: imageUrls
+      }
+    });
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({ error: 'Failed to upload images' });
+  }
+});
+
+// Delete product image (optional - removes file from server)
+app.delete('/merchants/store/delete-image', requireMerchantAuth, async (req, res) => {
+  const { filename } = req.body;
+  
+  if (!filename) {
+    return res.status(400).json({ error: 'Filename is required' });
+  }
+  
+  try {
+    const filePath = path.join(uploadDir, filename);
+    
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      res.json({ success: true, message: 'Image deleted successfully' });
+    } else {
+      res.status(404).json({ error: 'File not found' });
+    }
+  } catch (error) {
+    console.error('Delete error:', error);
+    res.status(500).json({ error: 'Failed to delete image' });
+  }
+});
+
 // ============ STORE MANAGEMENT ENDPOINTS ============
 
 // Create products table if not exists
